@@ -1,0 +1,677 @@
+---
+title: "MetaAnalysis Vagina"
+output: html_document
+date: "2025-09-15"
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(vegan)
+library(ape)
+library(ggplot2)
+library(metagenomeSeq)
+library(cowplot)
+library(ggrepel)
+library(tidyverse)
+library(RColorBrewer)
+library(patchwork)
+```
+
+```{r cars}
+file_paths <- c("genusPRJNA1071129.tsv", "genusPRJNA424567.tsv", 
+                "genusPRJNA546137.tsv")
+data_list <- lapply(file_paths, function(file) {
+  df <- read_tsv(file, skip = 1)
+  df <- df %>% 
+    column_to_rownames(var = "#OTU ID") %>%
+    t() %>%
+    as.data.frame()
+  return(df)
+})
+
+vagina <- bind_rows(data_list)
+vagina[is.na(vagina)] <- 0.0
+print(dim(vagina))
+
+meta <- read_csv("curated_Metadata.csv") %>%
+  column_to_rownames(var = "label")
+
+meta_aligned <- meta[rownames(vagina), ]
+labels <- meta_aligned$Class
+batch <- meta_aligned$BioProject
+
+library_sizes <- rowSums(vagina)
+
+min_depth <- 1000
+
+vagina <- vagina[library_sizes >= min_depth, ]
+labels <- labels[library_sizes >= min_depth]
+batch  <- batch[library_sizes >= min_depth]
+
+cat("Muestras eliminadas:", sum(library_sizes < min_depth), "\n")
+cat("Muestras retenidas:", nrow(vagina), "\n")
+
+```
+
+## Top 10 genera
+
+```{r}
+vagina_t <- vagina %>% as.data.frame()
+colnames(vagina_t) <- colnames(vagina_t) %>%
+  str_extract("g__[^;]*") %>%     
+  str_replace("^g__", "") %>%     
+  replace_na("Unclassified")       
+
+vagina_t <- as.data.frame(t(rowsum(t(vagina_t), group = colnames(vagina_t))))
+vagina_rel <- vagina_t / rowSums(vagina_t)
+
+top10_genera <- colSums(vagina_rel) %>%
+  sort(decreasing = TRUE) %>%
+  head(10) %>%
+  names()
+
+vagina_rel$Others <- rowSums(vagina_rel[, !colnames(vagina_rel) %in% top10_genera])
+vagina_top <- vagina_rel[, c(top10_genera, "Others")]
+vagina_top$Class <- labels
+vagina_top$Batch <- batch
+
+data_long_all <- vagina_top %>%
+  pivot_longer(cols = all_of(c(top10_genera, "Others")),
+               names_to = "Genus", values_to = "Abundance")
+
+
+genus_order <- data_long_all %>%
+  filter(Genus != "Others") %>%
+  group_by(Genus) %>%
+  summarize(mean_abund = mean(Abundance), .groups = "drop") %>%
+  arrange(desc(mean_abund)) %>%
+  pull(Genus)
+genus_order <- c("Others", genus_order)
+
+get_colors <- function(n) {
+  if (n <= 12) {
+    brewer.pal(n, "Set3")
+  } else {
+    colorRampPalette(brewer.pal(12, "Set3"))(n)
+  }
+}
+colors <- get_colors(length(genus_order))
+names(colors) <- genus_order
+colors["Others"] <- "#BBBBBB"
+colors["Lactobacillus"] <- "#8B5FBF"  
+
+plot_stacked_bar <- function(data, group_var, title, genus_order, colors, show_legend = FALSE) {
+  data_long <- data %>%
+    pivot_longer(cols = all_of(c(top10_genera, "Others")),
+                 names_to = "Genus", values_to = "Abundance") %>%
+    mutate(Genus = factor(Genus, levels = genus_order))
+  
+  p <- ggplot(data_long, aes_string(x = group_var, y = "Abundance", fill = "Genus")) +
+    stat_summary(fun = mean, geom = "bar", position = "stack") +
+    scale_fill_manual(values = colors, breaks = c(genus_order[-1], "Others")) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(title = title,
+         x = group_var,
+         y = "Mean relative abundance",
+         fill = "Genus") +
+    theme_minimal(base_size = 14) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+      axis.title = element_text(size = 14, face = "bold"),
+      legend.title = element_text(size = 13, face = "bold"),
+      legend.text = element_text(size = 11),
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+    )
+  
+  if (!show_legend) {
+    p <- p + theme(legend.position = "bottom")
+  }
+  return(p)
+}
+
+plot_class <- plot_stacked_bar(vagina_top, "Class", "", genus_order, colors, show_legend = FALSE)
+plot_batch <- plot_stacked_bar(vagina_top, "Batch", "", genus_order, colors, show_legend = FALSE)
+
+combined_plot <- plot_class + plot_batch +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.key.size = unit(0.7, "lines"),
+    legend.text = element_text(size = 10)
+  )
+
+combined_plot & 
+  theme(
+    panel.spacing = unit(1, "lines"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+print(combined_plot)
+#ggsave("vagina_plot_top10.png", combined_plot, width = 10, height = 9, units = "in", dpi = 900)
+
+```
+
+
+```{r}
+## 1. Rarefaction curves
+# Create rarefaction curves for all samples
+rarecurve(
+  vagina,
+  step = 100,           # increment in sequencing depth
+  sample = min(rowSums(vagina)), # max depth for comparison
+  col = "darkblue",
+  label = FALSE,
+  main = "Rarefaction Curves"
+)
+
+## 2. Sequencing depth distribution
+library_sizes <- rowSums(vagina)
+depth_df <- data.frame(
+  SampleID = names(library_sizes),
+  Depth = library_sizes,
+  Class = labels,
+  Batch = batch
+)
+
+ggplot(depth_df, aes(x = Depth, fill = Class)) +
+  geom_histogram(binwidth = 500, color = "black") +
+  labs(title = "Sequencing Depth Distribution",
+       x = "Reads per sample", y = "Number of samples") +
+  theme_bw()
+
+## 3. Depth vs Richness (observed species)
+richness <- specnumber(vagina)
+depth_vs_richness <- data.frame(
+  Depth = library_sizes,
+  Richness = richness,
+  Class = labels,
+  Batch = batch
+)
+
+ggplot(depth_vs_richness, aes(x = Depth, y = Richness, color = Class)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(title = "Observed Richness vs Sequencing Depth",
+       x = "Sequencing depth", y = "Richness") +
+  theme_bw()
+
+```
+
+## Rarefacción y cálculo de medidas de Alpha Diversity
+
+```{r pressure, echo=FALSE}
+set.seed(123)
+rarefied <- rrarefy(vagina, 10000)
+shannon_diversity <- diversity(rarefied, index = "shannon")
+richness <- specnumber(rarefied)
+
+
+alpha_df <- data.frame(
+  SampleID = rownames(rarefied),
+  Class = labels,
+  Batch = batch,
+  Shannon = shannon_diversity,
+  Richness = richness
+)
+
+wilcox_global <- wilcox.test(Shannon ~ Class, data = alpha_df)
+print(wilcox_global)
+
+wilcox_by_batch <- alpha_df %>%
+  group_by(Batch) %>%
+  summarise(
+    wilcox = list(wilcox.test(Shannon ~ Class)),
+    .groups = "drop"
+  ) %>%
+  mutate(p_value = sapply(wilcox, function(x) x$p.value)) %>%
+  select(Batch, p_value)
+
+print(wilcox_by_batch)
+
+p_val <- 0.095
+
+p1 <- ggplot(alpha_df, aes(x = Class, y = Shannon, fill = Class)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  labs(x = "Group", y = "Shannon Diversity") +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("Endometriosis" = "#F8766D", "Control" = "#00BFC4")) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(alpha_df$Shannon, na.rm = TRUE) * 1.05,
+    label = paste0("p = ", signif(p_val, 3)),
+    size = 4,
+    fontface = "italic"
+  )
+
+# --- Gráfico 2: Shannon por batch
+p2 <- ggplot(alpha_df, aes(x = Batch, y = Shannon, fill = Class)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.shape = NA) +
+  geom_jitter(
+    position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.8),
+    size = 1.2, alpha = 0.6
+  ) +
+  labs(x = "Batch", y = "Shannon Diversity") +
+  theme_bw(base_size = 14) +
+  scale_fill_manual(values = c("Endometriosis" = "#F8766D", "Control" = "#00BFC4"))
+
+# --- Combinar ambos con un título general
+final_plot <- plot_grid(
+  p1, p2,
+  ncol = 2,
+  align = "h",
+  rel_widths = c(0.25, 0.75)
+)
+
+
+
+
+```
+
+
+
+```{r}
+simpson_diversity <- diversity(rarefied, index = "simpson")
+richness <- specnumber(rarefied)
+
+alpha_df_simpson <- data.frame(
+  SampleID = rownames(rarefied),
+  Class = labels,
+  Batch = batch,
+  Simpson = simpson_diversity,
+  Richness = richness
+)
+
+
+wilcox_global <- wilcox.test(Simpson ~ Class, data = alpha_df_simpson)
+print(wilcox_global)
+
+wilcox_by_batch <- alpha_df_simpson %>%
+  group_by(Batch) %>%
+  summarise(
+    wilcox = list(wilcox.test(Simpson ~ Class)),
+    .groups = "drop"
+  ) %>%
+  mutate(p_value = sapply(wilcox, function(x) x$p.value)) %>%
+  select(Batch, p_value)
+p_val <- 0.096
+p1_simpson <- ggplot(alpha_df_simpson, aes(x = Class, y = Simpson, fill = Class)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  labs(x = "Group", y = "Simpson Diversity") +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("Endometriosis" = "#F8766D", "Control" = "#00BFC4")) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(alpha_df_simpson$Simpson, na.rm = TRUE) * 1.05,
+    label = paste0("p = ", signif(p_val, 3)),
+    size = 4,
+    fontface = "italic"
+  )
+
+p2_simpson <- ggplot(alpha_df_simpson, aes(x = Batch, y = Simpson, fill = Class)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.shape = NA) +
+  geom_jitter(
+    position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.8),
+    size = 1.2, alpha = 0.6
+  ) +
+  labs(x = "Batch", y = "Simpson Diversity") +
+  theme_bw(base_size = 14) +
+  scale_fill_manual(values = c("Endometriosis" = "#F8766D", "Control" = "#00BFC4"))
+
+final_plot_simpson <- plot_grid(
+  p1_simpson, p2_simpson,
+  ncol = 2,
+  align = "h",
+  rel_widths = c(0.25, 0.75)
+)
+
+
+```
+
+
+```{r}
+chao1_est <- estimateR(rarefied)   
+chao1 <- chao1_est["S.chao1", ]
+
+alpha_df_chao1 <- data.frame(
+  SampleID = rownames(rarefied),
+  Class = labels,
+  Batch = batch,
+  Chao1 = chao1
+)
+
+
+wilcox_global_chao1 <- wilcox.test(Chao1 ~ Class, data = alpha_df_chao1)
+print(wilcox_global_chao1)
+
+wilcox_by_batch_chao1 <- alpha_df_chao1 %>%
+  group_by(Batch) %>%
+  summarise(
+    wilcox = list(wilcox.test(Chao1 ~ Class)),
+    .groups = "drop"
+  ) %>%
+  mutate(p_value = sapply(wilcox, function(x) x$p.value)) %>%
+  select(Batch, p_value)
+
+print(wilcox_by_batch_chao1)
+
+p_val <- 0.135
+p1_chao1 <- ggplot(alpha_df_chao1, aes(x = Class, y = Chao1, fill = Class)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  labs(x = "Group", y = "Chao1 Richness") +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("Endometriosis" = "#F8766D", "Control" = "#00BFC4")) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = 115,
+    label = paste0("p = ", signif(p_val, 3)),
+    size = 4,
+    fontface = "italic"
+  )+
+  coord_cartesian(ylim = c(-20, 120))
+
+# --- Gráfico 2: Chao1 por batch
+p2_chao1 <- ggplot(alpha_df_chao1, aes(x = Batch, y = Chao1, fill = Class)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.shape = NA) +
+  geom_jitter(
+    position = position_jitterdodge(jitter.width = 0.2, dodge.width = 0.8),
+    size = 1.2, alpha = 0.6
+  ) +
+  labs(x = "Batch", y = "Chao1 Richness") +
+  theme_bw(base_size = 14) +
+  scale_fill_manual(values = c("Endometriosis" = "#F8766D", "Control" = "#00BFC4"))+ 
+  coord_cartesian(ylim = c(0, 115))
+
+final_plot_chao1 <- plot_grid(
+  p1_chao1, p2_chao1,
+  ncol = 2,
+  align = "h",
+  rel_widths = c(0.25, 0.75)
+)
+
+
+#ggsave("alpha_plot_vagina.png", final_plot / final_plot_simpson / final_plot_chao1 , width = 12, height = 9, units = "in", dpi = 900)
+```
+
+
+## Beta Diversity
+
+```{r}
+# --- CLR transform
+vagina_clr <- decostand(vagina, method = "clr", na.rm = TRUE, pseudocount = 0.000001)
+
+# --- PCA
+pca <- prcomp(vagina_clr, center = TRUE)
+
+# --- Explained variance (%)
+pca_summary <- summary(pca)
+explained_variance <- pca_summary$importance[2, 1:2] * 100
+
+# --- PCA data frame
+pca_df <- data.frame(
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2],
+  Label_Class = labels,
+  Label_Batch = batch
+)
+
+# --- Distance matrix
+dist_matrix <- dist(vagina_clr)
+
+# --- PERMANOVA (batch effect)
+permanova_res <- adonis2(dist_matrix ~ Label_Batch, data = pca_df, permutations = 999)
+print(permanova_res)
+
+r2_batch <- 0.106  
+p_value <- 0.001
+
+b2 <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Label_Batch, fill = Label_Batch)) +
+  geom_point(size = 3, alpha = 0.7) +
+  stat_ellipse(type = "t", level = 0.95, alpha = 0.2, geom = "polygon") +
+  labs(
+    title = "",
+    x = paste0("PC1 (", sprintf("%.1f%%", explained_variance[1]), " var)"),
+    y = paste0("PC2 (", sprintf("%.1f%%", explained_variance[2]), " var)"),
+    color = "BioProject",
+    fill = "BioProject"
+  ) +
+  annotate("text",
+           x = min(pca_df$PC1),
+           y = max(pca_df$PC2),
+           label = paste0("Batch effect: R² = ", sprintf("%.3f", r2_batch),
+                          ", PERMANOVA p = ", p_value),
+           hjust = -0.1, vjust = 0.2,
+           size = 5, fontface = "bold") +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "bottom")
+
+print(b2)
+
+# --- Guardar gráfico en alta resolución
+#ggsave("vagina_beta_plot.png", b2, width = 10, height = 7, units = "in", dpi = 900)
+
+```
+
+
+```{r}
+cols_lacto <- grep("Lactobacillus", colnames(vagina), value = TRUE)
+vagina_rel <- vagina / rowSums(vagina)
+vagina_lacto <- vagina_rel[, grepl("Lactobacillus", colnames(vagina_rel), ignore.case = TRUE)][, 1]
+
+test <- cut(
+  vagina_lacto,                 
+  breaks = c(-Inf, 0.5, 0.8, Inf),     
+  labels = c("not dominated", "moderately dominated", "strongly dominated")
+)
+
+tabla <- table(labels, test)
+
+barplot(
+  tabla,
+  beside = FALSE, 
+  col = c("lightblue", "orange", "red"),
+  legend.text = TRUE,
+  args.legend = list(title = "Dominance", x = "topright"),
+  main = "",
+  xlab = "Group",
+  ylab = "No. of samples"
+)
+```
+
+## Abundancia diferencial con metagenomeseq
+
+
+```{r}
+vagina <- t(vagina)
+pheno <- data.frame(labels = as.factor(labels))
+rownames(pheno) <- colnames(vagina)
+phenoData <- AnnotatedDataFrame(pheno)
+obj <- newMRexperiment(vagina, phenoData = phenoData)
+
+set.seed(123)
+min_prevalence <- 0.1
+min_samples <- ceiling(min_prevalence * ncol(vagina))
+
+present_counts <- rowSums(vagina > 0)
+keep_features_prev <- which(present_counts >= min_samples)
+
+batches <- pheno$batch
+unique_batches <- unique(batches)
+
+keep_features_batches <- sapply(1:nrow(vagina), function(i) {
+  all(sapply(unique_batches, function(b) any(vagina[i, batches == b] > 0)))
+})
+
+keep_features <- intersect(keep_features_prev, which(keep_features_batches))
+
+message(sprintf("Filtrando: %d -> %d features tras aplicar prevalencia y presencia en los 3 datasets.",
+                nrow(vagina), length(keep_features)))
+
+obj_filt <- obj[keep_features, ]
+
+p <- cumNormStat(obj_filt)  
+obj_norm <- cumNorm(obj_filt, p = p)  
+
+pheno_norm <- pData(obj_norm)
+pheno_norm$labels <- droplevels(as.factor(pheno_norm$labels))
+design <- model.matrix(~ labels + batch, data = pheno_norm)
+colnames(design) <- make.names(colnames(design))
+
+ctrl <- zigControl(maxit = 100, verbose = TRUE)
+fit <- fitZig(obj_norm, mod = design, control = ctrl)
+coef_of_interest <- 2
+
+res_full <- MRfulltable(fit, coef = coef_of_interest, number = 58)
+res_coefs <- MRcoefs(fit, coef = coef_of_interest, number = 58)
+
+if (!"adjPvalues" %in% colnames(res_full) && "pvalues" %in% colnames(res_full)) {
+  res_full$adjPvalues <- p.adjust(res_full$pvalues, method = "BH")
+}
+res_full <- res_full[order(res_full$adjPvalues), ]
+res_full$logFC <- res_full$labelsEndometriosis
+res_full$Genus <- sub(".*;([g].*)", "\\1", rownames(res_full))
+
+#write.csv(x = data.frame(rownames(res_full)[1:13]), "selected.tsv", sep="\t")
+```
+```{r}
+res_full$group <- "NS"
+res_full$group[res_full$adjPvalues < 0.05 & res_full$logFC > 1.0] <- "Up"
+res_full$group[res_full$adjPvalues < 0.05 & res_full$logFC < -1.0] <- "Down"
+res_full <- res_full[!res_full$Genus %in% c("g__Incertae_Sedis"),]
+xlim_val <- max(abs(res_full$logFC), na.rm = TRUE)
+
+ggplot(res_full, aes(x = logFC, y = -log10(adjPvalues))) +
+  geom_point(aes(color = group), alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") + 
+  scale_color_manual(values = c("NS" = "black", "Up" = "red", "Down" = "blue")) +
+  geom_text_repel(
+    data = subset(res_full , group != "NS"),
+    aes(label = Genus),
+    size = 3,
+    max.overlaps = Inf,    
+    force = 2,            
+    box.padding = 0.5,
+    point.padding = 0.2,
+    segment.curvature = 0.2,
+    segment.angle = 20
+  ) +
+  labs(
+    x = "Fold Change",
+    y = "-log10 (adj. p-value)",
+    color = "",
+    title = ""
+  ) +
+  scale_x_continuous(limits = c(-xlim_val, xlim_val)) + 
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5)
+  )
+
+```
+```{r}
+xlim_val <- max(abs(res_full$logFC), na.rm = TRUE)
+
+# Volcano plot
+da1 <- ggplot(res_full, aes(x = logFC, y = -log10(adjPvalues))) +
+  geom_point(aes(color = group), alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40") +
+  scale_color_manual(values = c("NS" = "black", "Up" = "red", "Down" = "blue")) +
+  geom_text_repel(
+    data = subset(res_full, group != "NS" & !is.na(Genus)),
+    aes(label = Genus),
+    size = 3,
+    max.overlaps = Inf,
+    force = 2,
+    box.padding = 0.5,
+    point.padding = 0.2,
+    segment.curvature = 0.2,
+    segment.angle = 20
+  ) +
+  labs(
+    x = "Fold Change",
+    y = "-log10 (adj. p-value)",
+    color = "",
+    title = ""
+  ) +
+  scale_x_continuous(limits = c(-xlim_val, xlim_val-1)) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    plot.title = element_text(hjust = 0.5)
+  )
+
+#ggsave("da_plot.png", da1, width = 10, height = 7, units = "in", dpi = 900)
+
+```
+
+## Picrust
+
+```{r echo=FALSE}
+library(ggpicrust2)
+library(tibble)
+library(MicrobiomeStat)
+library(ggrepel)
+```
+
+```{r echo=FALSE}
+ko_abundance_file <- "pred_metagenome_unstrat.tsv"
+ko_abundance <- ko2kegg_abundance(ko_abundance_file)
+THRESHOLD <-0.0001
+l1 <- meta[colnames(ko_abundance),]
+```
+```{r echo=FALSE}
+daa_results_df <- pathway_daa(
+  abundance = ko_abundance,
+  metadata = l1,
+  group = "Class",
+  daa_method = "LinDA", include_abundance_stats=TRUE
+)
+
+n_muestras_min <- 2
+abundance_filtered <- ko_abundance[rowSums(ko_abundance > 0) >= n_muestras_min, ]
+abundance_filtered <- abundance_filtered[rowSums(abundance_filtered) / sum(abundance_filtered) > 0.00001, ]
+daa_results_df_filtered <- pathway_daa(
+  abundance = abundance_filtered, # Usa los datos filtrados
+  metadata = l1,
+  group = "Class",
+  daa_method = "LinDA", include_abundance_stats=TRUE
+)
+
+print(paste("Vías originales:", nrow(ko_abundance)))
+print(paste("Vías después del filtro:", nrow(abundance_filtered)))
+```
+```{r echo=FALSE}
+daa_annotated <- pathway_annotation(
+  pathway = "KO",
+  daa_results_df = daa_results_df_filtered,
+  ko_to_kegg = TRUE
+)
+
+r<-daa_annotated[daa_annotated$mean_rel_abundance_group2 > THRESHOLD, ]
+p<-pathway_errorbar(ko_abundance, daa_annotated, l1$Class, x_lab="pathway_name", order="p_values", pvalue_size=3)
+
+p2<- pathway_errorbar(ko_abundance, r, l1$Class, x_lab="pathway_name", order="p_values",   pvalue_format = "numeric",
+  pvalue_size = 3, legend_position = "none")
+
+ggsave(
+  filename = "otro.png",
+  plot = p2,
+  width = 10,
+  height = 2.2,       
+  units = "in",    
+  dpi = 900         
+)
+```
