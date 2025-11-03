@@ -20,7 +20,7 @@ library(RColorBrewer)
 library(patchwork)
 ```
 
-```{r cars}
+```{r}
 file_paths <- c("genusPRJNA546137.tsv", "genusTablePRJNA722289NEW.tsv")
 data_list <- lapply(file_paths, function(file) {
   df <- read_tsv(file, skip = 1)

@@ -20,7 +20,7 @@ library(RColorBrewer)
 library(patchwork)
 ```
 
-```{r cars}
+```{r}
 file_paths <- c("genusTable1071129.tsv", "genusTable1140858NEW.tsv", 
                 "genusTable424567.tsv", "genusTable715238.tsv", 
                 "genusTable753920.tsv")
